@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-ses_bridge.py — мост SES ↔ Hermes.
+ses_bridge.py — SES ↔ agent-framework bridge.
 
-  verify <snapshot.ses.json>      проверить целостность (canonical SHA-256)
-  export-skills [learned_dir]     уроки (CORE/lesson) из графа → Hermes skill-стабы
-  import-ocean <ocean_db.sqlite>  импорт узлов из настоящего Ocean (read-only)
+  verify <snapshot.ses.json>      verify integrity (canonical SHA-256)
+  export-skills [learned_dir]     export lessons (CORE/lesson) as Hermes skill stubs
+  import-ocean <ocean_db.sqlite>  import nodes from an original Ocean DB (read-only)
 
-Pure stdlib. Граф берётся из QCA_STORE (см. qca_engine.py).
+Pure stdlib. The graph store comes from QCA_STORE (see qca_engine.py).
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ def verify(path: str) -> bool:
     claimed = doc.get("provenance", {}).get("hash", "")
     actual = "sha256:" + hashlib.sha256(canonical_json(doc["body"]).encode()).hexdigest()
     ok = claimed == actual
-    print(f"{'✅ целостность подтверждена' if ok else '❌ ТАМПЕР: хэш не совпадает'}")
+    print(f"{'✅ integrity verified' if ok else '❌ TAMPERED: hash mismatch'}")
     print(f"  claimed: {claimed}\n  actual:  {actual}")
     return ok
 
@@ -34,7 +34,7 @@ def export_skills(learned_dir: str = LEARNED_DIR):
     lessons = [n for n in g.nodes
                if n.get("layer") == "CORE" and n["meta"].get("kind") == "lesson"]
     if not lessons:
-        print("уроков (CORE/lesson) в графе нет"); return
+        print("no lessons (CORE/lesson) in the graph"); return
     os.makedirs(learned_dir, exist_ok=True)
     for n in lessons:
         slug = re.sub(r"[^a-z0-9а-яё]+", "-", n["_text"][:50].lower()).strip("-") or n["id"].lower()
@@ -47,26 +47,27 @@ name: qca-lesson-{n['id'].lower()}
 description: "{n['_text'][:140].replace('"', "'")}"
 platforms: [linux, macos, windows]
 metadata:
-  source: ocean-qca-cycle
+  source: qca-cycle
   confidence: {conf}
   node_id: {n['id']}
   exported: {_now()}
 ---
 
-# Урок QCA: {slug}
+# QCA lesson: {slug}
 
 {n['_text']}
 
-> Авто-экспорт из графа QCA (H8-рефлексия). Confidence: {conf}.
-> Curator может развить этот стаб в полноценный скилл.
+> Auto-exported from the QCA graph (lesson extraction). Confidence: {conf}.
+> The Curator may grow this stub into a full skill.
 """)
         print(f"→ {d}/SKILL.md (confidence={conf})")
-    print(f"экспортировано уроков: {len(lessons)}")
+    print(f"lessons exported: {len(lessons)}")
 
 
 def _clean_ocean_text(text: str) -> str:
-    """Срезать служебную обёртку Ocean ('[ОПЫТ|...] Контекст: X → Действие: Y') —
-    она разбавляет эмбеддинг и роняет recall ниже порога 0.70."""
+    """Strip Ocean's service wrapper ('[ОПЫТ|...] Контекст: X → Действие: Y') —
+    it dilutes the embedding and drops recall below the 0.70 threshold.
+    (The wrapper is Russian because original Ocean memories are; keep as is.)"""
     m = re.match(r"^\[ОПЫТ\|[^\]]*\]\s*Контекст:\s*(.*?)\s*→\s*Действие:\s*(.*)$",
                  text, flags=re.DOTALL)
     if m:
@@ -76,7 +77,8 @@ def _clean_ocean_text(text: str) -> str:
 
 
 def import_ocean(db_path: str):
-    """Импорт активных узлов из SQLite настоящего Ocean. Источник не модифицируется."""
+    """Import active nodes from an original Ocean SQLite DB. The source is opened
+    read-only and never modified."""
     src = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     src.row_factory = sqlite3.Row
     g = Graph()
@@ -87,7 +89,7 @@ def import_ocean(db_path: str):
         d = dict(r)
         text = d.get("_text") or d.get("text") or ""
         if not text.strip():
-            # текст может лежать в JSON-поле
+            # the text may live inside a JSON field
             for v in d.values():
                 if isinstance(v, str) and v.startswith("{"):
                     try:
@@ -104,7 +106,7 @@ def import_ocean(db_path: str):
         g.add_node(text, layer=layer, role="system", meta={"imported_from": "ocean", "src_id": d.get("id")})
         existing.add(text); added += 1
     g.save()
-    print(f"импортировано: {added}, пропущено: {skipped}, всего в графе: {len(g.nodes)}")
+    print(f"imported: {added}, skipped: {skipped}, total in graph: {len(g.nodes)}")
 
 
 def main():
@@ -118,7 +120,7 @@ def main():
     elif cmd == "import-ocean":
         import_ocean(args[0])
     else:
-        print(f"неизвестная команда: {cmd}\n{__doc__}")
+        print(f"unknown command: {cmd}\n{__doc__}")
 
 
 if __name__ == "__main__":

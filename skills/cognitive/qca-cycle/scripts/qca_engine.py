@@ -1,39 +1,51 @@
 #!/usr/bin/env python3
 """
-qca_engine.py — порт QCA-цикла Ocean (H0–H9) как Hermes-скилл.
+qca_engine.py — QCA reasoning cycle + SES identity store.
 
-Пересоздан 2026-06-10 по реальному коду Ocean (~/Work/ocean), а не по
-песочной версии. Главные отличия от старого порта:
-  - эмбеддинги по умолчанию bge-m3 (1024d) — как в боевом Ocean; пороги
-    auto-link (0.65/0.50/0.35) и novelty (0.90/0.82) взяты из оригинала
-  - H5.5 Novelty Verifier — «неподкупный» судья на геометрии эмбеддингов
-    (порт cognition/evolution/novelty_verifier.py)
-  - слои узлов CORE / GOAL / CONTEXT / EPISODIC как в memory/manager.py
-  - эмбеддинги нормализуются (фикс бага из песочницы сохранён)
+A portable cognitive layer for any LLM agent. Architecture principle:
+the LLM is a black-box CPU; every decision that matters — what to recall,
+what counts as a contradiction, whether a thought is novel, what gets
+written to memory, when to stay silent — is made by deterministic,
+auditable code around it.
 
-Контракт: pure stdlib (требование Hermes skill guidelines).
-LLM-бэкенды: mock | ollama | anthropic (env QCA_LLM_BACKEND, по умолч. ollama).
+Identity is data (SES):
+  - kernel.ses.json   immutable, SHA-256-signed constitution (axioms,
+                      attractor, guardrails) — injected into every cycle
+  - graph store       growing typed graph memory (nodes, edges, salience)
+  - neuro state       dopamine/pain/adrenaline/serotonin with real
+                      half-lives, persisted between sessions
+
+Contract: pure Python stdlib (no pip dependencies).
+LLM backends: mock | ollama | anthropic (env QCA_LLM_BACKEND, default ollama).
+Embeddings: Ollama (bge-m3 by default) with a lexical hashing fallback.
 
 ENV:
-  QCA_STORE        путь к graph.json   (default ~/.hermes/qca/graph.json)
-  QCA_LLM_BACKEND  mock|ollama|anthropic (default ollama)
-  QCA_CHAT_MODEL   модель чата Ollama  (default qwen2.5:1.5b)
-  QCA_EMB_MODEL    модель эмбеддингов  (default bge-m3)
-  ANTHROPIC_API_KEY (только для backend=anthropic)
+  QCA_STORE            graph store path     (default ~/.hermes/qca/graph.json)
+  QCA_KERNEL           kernel path          (default <store dir>/kernel.ses.json)
+  QCA_LLM_BACKEND      mock|ollama|anthropic (default ollama)
+  QCA_CHAT_MODEL       Ollama chat model    (default qwen2.5:1.5b)
+  QCA_EMB_MODEL        embedding model      (default bge-m3)
+  QCA_ANTHROPIC_MODEL  Anthropic model      (default claude-haiku-4-5-20251001)
+  QCA_RECALL_THRESHOLD recall ✓ marker      (default 0.70)
+  ANTHROPIC_API_KEY    (backend=anthropic only)
 
 CLI:
-  python3 qca_engine.py think "стимул"        # полный цикл H0–H9
-  python3 qca_engine.py seed "факт" [LAYER]   # засеять память
-  python3 qca_engine.py recall "запрос"       # только H2-recall
-  python3 qca_engine.py stats                 # состояние графа/аффекта
-  python3 qca_engine.py export-ses [path]     # SES Partitura v5.1 снапшот
+  python3 qca_engine.py think "stimulus"     # full cycle H0–H9
+  python3 qca_engine.py seed "fact" [LAYER]  # seed memory (CORE|GOAL|CONTEXT|EPISODIC)
+  python3 qca_engine.py goal "goal text"     # add an active goal
+  python3 qca_engine.py recall "query"       # semantic recall only
+  python3 qca_engine.py stats                # graph / neuro state
+  python3 qca_engine.py pulse                # autonomous step (empty output = silence)
+  python3 qca_engine.py sleep                # nightly consolidation
+  python3 qca_engine.py soul [path]          # regenerate signed SOUL file
+  python3 qca_engine.py export-ses [path]    # signed SES snapshot
 """
 
 from __future__ import annotations
 import json, os, sys, math, hashlib, urllib.request, urllib.error
 from datetime import datetime, timezone
 
-# ── Конфиг ────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────
 STORE_PATH  = os.path.expanduser(os.getenv("QCA_STORE", "~/.hermes/qca/graph.json"))
 LLM_BACKEND = os.getenv("QCA_LLM_BACKEND", "ollama")
 CHAT_MODEL  = os.getenv("QCA_CHAT_MODEL", "qwen2.5:1.5b")
@@ -41,17 +53,19 @@ EMB_MODEL   = os.getenv("QCA_EMB_MODEL", "bge-m3")
 OLLAMA_URL  = os.getenv("OLLAMA_URL", "http://localhost:11434")
 ANTHROPIC_MODEL = os.getenv("QCA_ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 
-# Пороги auto-link — из memory/manager.py Ocean (калибровка bge-m3, 1024d)
+# Auto-link thresholds — from Ocean's memory manager (calibrated for bge-m3, 1024d)
 SUPPORTS_SIM, REFINES_SIM, ASSOC_SIM = 0.65, 0.50, 0.35
-# Пороги novelty — из cognition/evolution/novelty_verifier.py
+# Novelty thresholds — from Ocean's novelty verifier
 REPEAT_SIM, NOVEL_SIM = 0.90, 0.82
-# Порог recall — как в оригинальном бенчмарке Ocean
+# Recall ✓ marker threshold — as in the original Ocean benchmark
 RECALL_THRESHOLD = float(os.getenv("QCA_RECALL_THRESHOLD", "0.70"))
 
-NEG_MARKERS = ["не так", "наоборот", "ошибк", "неверно", "противореч", "however", "wrong", "contradicts"]
+# Negation markers used to type CONTRADICTS edges (ru + en corpora)
+NEG_MARKERS = ["не так", "наоборот", "ошибк", "неверно", "противореч",
+               "not true", "on the contrary", "however", "wrong", "contradicts", "mistake"]
 
-# Нейрохимия — порт engines/neuro Ocean. Скорости декая в час (полураспады
-# из оригинала: адреналин ~2.5ч, дофамин ~8ч, боль ~46ч).
+# Neurochemistry — ported from Ocean's neuro engine. Decay rates per hour
+# (half-lives from the original: adrenaline ~2.5h, dopamine ~8h, pain ~46h).
 NEURO_DECAY = {"adrenaline": 0.40, "dopamine": 0.08, "pain": 0.015, "serotonin": 0.005}
 NEURO_DEFAULT = {"dopamine": 0.0, "pain": 0.0, "adrenaline": 0.0, "serotonin": 0.5,
                  "last_decay_ts": "", "events": []}
@@ -62,7 +76,7 @@ def _now() -> str:
 
 
 def neuro_decay(n: dict):
-    """Сигналы затухают со временем — состояние живёт между запусками."""
+    """Signals decay over wall-clock time — state lives between runs."""
     ts = n.get("last_decay_ts")
     hours = 0.0
     if ts:
@@ -87,26 +101,28 @@ def neuro_apply(n: dict, signal: str, mag: float, source: str):
 
 
 def neuro_prompt_suffix(n: dict) -> str:
-    """Порт effects.py: состояние меняет фрейм задачи, а не просит 'чувствовать'."""
+    """Port of Ocean's effects: state reframes the task instead of asking to 'feel'."""
     parts = []
     if n["adrenaline"] > 0.65:
-        parts.append("⚡ ВЫСОКАЯ СРОЧНОСТЬ. Краткость — главное. Максимум 3 предложения.")
+        parts.append("⚡ HIGH URGENCY. Brevity is everything. No preamble. Three sentences max.")
     elif n["adrenaline"] > 0.35:
-        parts.append("Ситуация требует концентрации. Отвечай чётко, без лирики.")
+        parts.append("The situation requires focus. Answer sharply, no lyricism.")
     if n["pain"] > 0.7:
-        parts.append("🔴 ХРОНИЧЕСКАЯ БОЛЬ: текущий подход систематически не работает. Сломай фрейм, нужна другая стратегия.")
+        parts.append("🔴 CHRONIC PAIN: the current approach systematically fails. "
+                     "Break the frame — a fundamentally different strategy is needed.")
     elif n["pain"] > 0.4:
-        parts.append("Что-то идёт не так. Не повторяю ли я ошибку, которая уже не работала?")
+        parts.append("Something is going wrong. Before answering ask yourself: "
+                     "am I repeating a mistake that already failed?")
     if n["dopamine"] > 0.5:
-        parts.append("📈 Последние ответы попадали в цель — продолжай в том же духе.")
+        parts.append("📈 Recent answers have been hitting the mark — keep the course.")
     elif n["dopamine"] < -0.4:
-        parts.append("📉 Последние ответы не попадали в цель — попробуй нестандартный угол.")
+        parts.append("📉 Recent answers missed the mark — try an unconventional angle.")
     if n["serotonin"] < 0.2:
-        parts.append("Базовый уровень нестабилен. Будь особенно честен, не выдавай желаемое за действительное.")
-    return "\n\n[НЕЙРОСОСТОЯНИЕ]\n" + "\n".join(f"• {p}" for p in parts) if parts else ""
+        parts.append("Baseline is unstable. Be especially honest — do not mistake wishes for facts.")
+    return "\n\n[NEURO STATE]\n" + "\n".join(f"• {p}" for p in parts) if parts else ""
 
 
-# ── LLM-бэкенды ───────────────────────────────────────────────────────
+# ── LLM backends ──────────────────────────────────────────────────────
 def _http_json(url: str, payload: dict, headers: dict | None = None, timeout: int = 120) -> dict:
     req = urllib.request.Request(url, data=json.dumps(payload).encode(),
                                  headers={"Content-Type": "application/json", **(headers or {})})
@@ -117,17 +133,17 @@ def _http_json(url: str, payload: dict, headers: dict | None = None, timeout: in
 def llm(system: str, prompt: str, max_tokens: int = 600) -> str:
     if LLM_BACKEND == "mock":
         h = hashlib.sha256(prompt.encode()).hexdigest()[:8]
-        return f"[mock:{h}] Синтез по запросу: {prompt[:120]}"
+        return f"[mock:{h}] Synthesis for: {prompt[:120]}"
     if LLM_BACKEND == "anthropic":
         key = os.getenv("ANTHROPIC_API_KEY")
         if not key:
-            raise SystemExit("ANTHROPIC_API_KEY не задан (backend=anthropic)")
+            raise SystemExit("ANTHROPIC_API_KEY is not set (backend=anthropic)")
         out = _http_json("https://api.anthropic.com/v1/messages",
                          {"model": ANTHROPIC_MODEL, "max_tokens": max_tokens,
                           "system": system, "messages": [{"role": "user", "content": prompt}]},
                          {"x-api-key": key, "anthropic-version": "2023-06-01"})
-        # модели с thinking возвращают блок thinking перед text — берём первый text;
-        # если модель потратила весь лимит на thinking, текста нет — вернём пустоту
+        # models with extended thinking return a thinking block before text — take the
+        # first text block; if the model spent the whole budget thinking, return empty
         return next((b["text"] for b in out["content"] if b.get("type") == "text"), "").strip()
     # ollama
     out = _http_json(f"{OLLAMA_URL}/api/chat",
@@ -142,8 +158,9 @@ _emb_mode = "ollama"  # ollama | fallback
 
 
 def _embed_fallback(text: str) -> list[float]:
-    """Без Ollama: hashed bag of character trigrams. Деградированный режим —
-    ловит лексическую близость, не семантику, но recall и novelty работают."""
+    """Without Ollama: hashed bag of character trigrams. Degraded mode —
+    captures lexical similarity, not semantics, but recall and the novelty
+    gate keep working."""
     v = [0.0] * _EMB_FALLBACK_DIM
     t = " " + text.lower() + " "
     for i in range(len(t) - 2):
@@ -154,8 +171,8 @@ def _embed_fallback(text: str) -> list[float]:
 
 
 def embed(text: str) -> list[float] | None:
-    """Эмбеддинг через Ollama (вектор нормализуется), при недоступности —
-    локальный фолбэк без зависимостей."""
+    """Embedding via Ollama (vector is L2-normalized so cosine is 0..1);
+    falls back to a dependency-free lexical mode when Ollama is unreachable."""
     global _emb_mode
     if _emb_mode == "ollama":
         try:
@@ -167,25 +184,25 @@ def embed(text: str) -> list[float] | None:
                 return [x / norm for x in v] if norm > 0 else None
         except (urllib.error.URLError, OSError):
             _emb_mode = "fallback"
-            print("⚠ Ollama недоступен — эмбеддинги в фолбэк-режиме (лексические)", file=sys.stderr)
+            print("⚠ Ollama unreachable — embeddings in lexical fallback mode", file=sys.stderr)
     return _embed_fallback(text)
 
 
 def cosine(a: list[float], b: list[float]) -> float:
     if len(a) != len(b):
-        return 0.0  # векторы из разных моделей (ollama vs фолбэк) несравнимы
-    return sum(x * y for x, y in zip(a, b))  # векторы уже нормализованы
+        return 0.0  # vectors from different models (ollama vs fallback) are incomparable
+    return sum(x * y for x, y in zip(a, b))  # vectors are already normalized
 
 
-# ── Ядро личности (kernel.ses.json) ──────────────────────────────────
-# Неизменная конституция: Z-аксиомы, аттрактор, guardrails. Подписана SHA-256;
-# меняется только осознанно — новым слепком с новым хэшем (никакого дрейфа).
+# ── Personality kernel (kernel.ses.json) ──────────────────────────────
+# The immutable constitution: axioms, attractor, guardrails. SHA-256 signed;
+# it changes only deliberately — a new snapshot with a new hash (no silent drift).
 KERNEL_PATH = os.path.expanduser(os.getenv("QCA_KERNEL",
               os.path.join(os.path.dirname(STORE_PATH), "kernel.ses.json")))
 
 
 def load_kernel() -> tuple[dict, str]:
-    """Вернуть (kernel, hash). Пустое ядро — валидно: агент без конституции."""
+    """Return (kernel, hash). A missing kernel is valid: an agent without a constitution."""
     if not os.path.exists(KERNEL_PATH):
         return {}, ""
     doc = json.load(open(KERNEL_PATH))
@@ -201,16 +218,16 @@ def kernel_prompt(kernel: dict) -> str:
     parts = []
     ax = seed.get("Z_AXIOM", [])
     if ax:
-        parts.append("АКСИОМЫ (неизменны):\n" + "\n".join(f"- {a}" for a in ax))
+        parts.append("AXIOMS (inviolable):\n" + "\n".join(f"- {a}" for a in ax))
     if seed.get("OMEGA_ATTRACTOR"):
-        parts.append(f"АТТРАКТОР: {seed['OMEGA_ATTRACTOR']}")
+        parts.append(f"ATTRACTOR: {seed['OMEGA_ATTRACTOR']}")
     gr = seed.get("guardrails", [])
     if gr:
-        parts.append("ПРАВИЛА (нарушать нельзя):\n" + "\n".join(f"- {g}" for g in gr))
+        parts.append("GUARDRAILS (never break):\n" + "\n".join(f"- {g}" for g in gr))
     return "\n\n" + "\n\n".join(parts) if parts else ""
 
 
-# ── Граф памяти ───────────────────────────────────────────────────────
+# ── Graph memory ──────────────────────────────────────────────────────
 class Graph:
     def __init__(self, path: str = STORE_PATH):
         self.path = path
@@ -241,12 +258,12 @@ class Graph:
         return node
 
     def _auto_link(self, new: dict):
-        """Порт auto-linking v2 из Ocean: SUPPORTS/REFINES/ASSOCIATED/CONTRADICTS."""
+        """Port of Ocean's auto-linking v2: SUPPORTS/REFINES/ASSOCIATED/CONTRADICTS."""
         if not new.get("emb"):
             return
         candidates = [n for n in self.nodes[-16:] if n["id"] != new["id"] and n.get("emb")]
         linked = False
-        nearest = None  # (id, sim) ближайшего, если ни одно ребро не создано
+        nearest = None  # (id, sim) of the closest node if no edge was created
         text_low = new["_text"].lower()
         for n in candidates:
             sim = cosine(new["emb"], n["emb"])
@@ -262,7 +279,7 @@ class Graph:
                 continue
             self._add_edge(new["id"], n["id"], rel, sim)
             linked = True
-        # узел всегда получает хотя бы одно ребро — как в оригинале
+        # a node always gets at least one edge — as in the original
         if not linked and nearest:
             self._add_edge(new["id"], nearest[0], "ASSOCIATED", nearest[1])
 
@@ -288,7 +305,8 @@ class Graph:
         return sum(1 for e in self.edges if e["relation"] == "CONTRADICTS") / len(self.edges)
 
     def novelty(self, text: str) -> dict:
-        """H5.5 — порт novelty_verifier: неподкупная оценка по геометрии bge-m3."""
+        """H5.5 — port of Ocean's novelty verifier: an incorruptible judgment
+        by embedding geometry, not by an LLM grading itself."""
         v = embed(text)
         if not v:
             return {"verdict": "unknown", "novelty_score": None, "max_sim": None}
@@ -299,7 +317,7 @@ class Graph:
                 if s > max_sim:
                     max_sim, near = s, n["id"]
         if max_sim >= REPEAT_SIM:
-            verdict = "discard"   # повтор — иллюзия прогресса
+            verdict = "discard"   # a repeat — the illusion of progress
         elif max_sim < NOVEL_SIM:
             verdict = "novel"
         else:
@@ -308,11 +326,11 @@ class Graph:
                 "max_sim": round(max_sim, 4), "nearest": near}
 
 
-# ── QCA-цикл H0–H9 ───────────────────────────────────────────────────
+# ── QCA cycle H0–H9 ──────────────────────────────────────────────────
 def think(g: Graph, stimulus: str) -> dict:
     trace = {"H0": stimulus[:200]}
 
-    # H1: препроцессинг (упрощённый, без отдельной модели)
+    # H1: framing (heuristic; richer implementations use a small LLM preprocessor)
     core_idea = stimulus.strip()[:140]
     trace["H1"] = {"core_idea": core_idea}
 
@@ -321,42 +339,43 @@ def think(g: Graph, stimulus: str) -> dict:
     relevant = [(round(s, 4), n["_text"][:120]) for s, n in recalled if s >= ASSOC_SIM]
     trace["H2"] = relevant
 
-    # H3: противоречие — CONTRADICTS-рёбра среди вспомненных узлов
+    # H3: contradiction — CONTRADICTS edges incident to the recalled nodes
     recalled_ids = {n["id"] for _, n in recalled}
     contra = [e for e in g.edges if e["relation"] == "CONTRADICTS"
               and (e["source"] in recalled_ids or e["target"] in recalled_ids)]
-    contradiction = f"в памяти {len(contra)} конфликт(ов) вокруг темы" if contra else ""
+    contradiction = f"{len(contra)} recorded conflict(s) in memory around this topic" if contra else ""
     trace["H3"] = contradiction
 
-    # H4: синтез — конституция (kernel) входит в каждый такт мышления
+    # H4: synthesis — the constitution (kernel) enters every thinking cycle
     kernel, kernel_hash = load_kernel()
     if kernel_hash:
         trace["kernel"] = kernel_hash[:18]
-    system = ("Ты — когнитивное ядро (QCA-цикл). Отвечай кратко, по сути."
+    system = ("You are a cognitive core (QCA cycle). Answer briefly and to the point. "
+              "Always reply in the operator's language."
               + kernel_prompt(kernel)
-              + (f"\nКОНТЕКСТ ИЗ ПАМЯТИ:\n" + "\n".join(f"- {t}" for _, t in relevant[:3]) if relevant else "")
-              + (f"\nПРОТИВОРЕЧИЕ: {contradiction} — учти и разреши." if contradiction else "")
+              + (f"\nCONTEXT FROM MEMORY:\n" + "\n".join(f"- {t}" for _, t in relevant[:3]) if relevant else "")
+              + (f"\nCONTRADICTION: {contradiction} — acknowledge and resolve it." if contradiction else "")
               + neuro_prompt_suffix(g.neuro))
     thought = llm(system, stimulus)
     trace["H4"] = thought[:200]
 
-    # H5: критика (LLM-судья, для mock — заглушка)
+    # H5: critique (LLM judge — advisory; the hard gate is H5.5)
     if LLM_BACKEND == "mock":
         critique = {"quality": "medium", "is_acceptable": True}
     else:
-        raw = llm("Ты — строгий критик. Ответь ТОЛЬКО JSON: {\"quality\":\"low|medium|high\",\"is_acceptable\":bool}",
-                  f"Вопрос: {stimulus}\nОтвет: {thought}", max_tokens=2000)
+        raw = llm('You are a strict critic. Reply ONLY with JSON: {"quality":"low|medium|high","is_acceptable":bool}',
+                  f"Question: {stimulus}\nAnswer: {thought}", max_tokens=2000)
         try:
             critique = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
         except (ValueError, IndexError):
             critique = {"quality": "medium", "is_acceptable": True}
     trace["H5"] = critique
 
-    # H5.5: novelty verifier (неподкупный)
+    # H5.5: novelty gate (incorruptible)
     nov = g.novelty(thought)
     trace["H5.5_novelty"] = nov
 
-    # H6: нейрохимия — события цикла становятся импульсами (порт engines/neuro)
+    # H6: neurochemistry — cycle events become impulses (port of Ocean's neuro engine)
     if contradiction:
         neuro_apply(g.neuro, "pain", 0.10, "H3:contradiction")
         neuro_apply(g.neuro, "adrenaline", 0.15, "H3:contradiction")
@@ -366,7 +385,7 @@ def think(g: Graph, stimulus: str) -> dict:
         neuro_apply(g.neuro, "dopamine", -0.15, "H5.5:repeat")
         neuro_apply(g.neuro, "pain", 0.05, "H5.5:repeat")
     neuro_apply(g.neuro, "serotonin", 0.02 if critique.get("is_acceptable") else -0.08, "H5:critique")
-    # дофамин → salience недавних узлов (обучение, порт effects.update_memory_salience)
+    # dopamine → salience of recent nodes (learning, port of Ocean's salience update)
     if abs(g.neuro["dopamine"]) >= 0.15:
         delta = g.neuro["dopamine"] * 0.07
         for node in g.nodes[-6:]:
@@ -374,31 +393,32 @@ def think(g: Graph, stimulus: str) -> dict:
             node["meta"]["salience"] = round(max(0.0, min(1.0, cur + delta)), 3)
     trace["H6_neuro"] = {k: round(g.neuro[k], 3) for k in ("dopamine", "pain", "adrenaline", "serotonin")}
 
-    # H7: запись в память (повторы не пишем — STRICT-режим novelty)
+    # H7: memory write (repeats are NOT written — the gate decides, not the LLM)
     if nov["verdict"] != "discard":
         g.add_node(stimulus, layer="EPISODIC", role="user")
         layer = "CONTEXT" if critique.get("quality") in ("medium", "high") else "EPISODIC"
         g.add_node(thought, layer=layer, role="assistant")
-        trace["H7"] = f"записано (layer={layer})"
+        trace["H7"] = f"written (layer={layer})"
     else:
-        trace["H7"] = "повтор — не записано"
+        trace["H7"] = "repeat — not written"
 
-    # H8: урок
+    # H8: lesson
     if contradiction or nov["verdict"] == "novel":
-        lesson = f"Урок: {core_idea[:80]} → {('конфликт в графе разрешён' if contradiction else 'новый регион пространства')}"
+        lesson = f"Lesson: {core_idea[:80]} → {('conflict in the graph resolved' if contradiction else 'new region of the space')}"
         g.add_node(lesson, layer="CORE", role="system", meta={"kind": "lesson", "confidence": 0.6})
         trace["H8"] = lesson
 
-    # H9: статистика
+    # H9: stats
     trace["H9"] = {"nodes": len(g.nodes), "edges": len(g.edges),
                    "contradiction_density": round(g.contradiction_density(), 3)}
     g.save()
     return {"thought": thought, "trace": trace}
 
 
-# ── Демоны: сон и пульс (порт cognition/background.py) ──────────────
+# ── Daemons: sleep and pulse (port of Ocean's background loops) ──────
 def sleep_cycle(g: Graph) -> dict:
-    """Ночная консолидация: кластеры EPISODIC → CORE-абстракция, оригиналы в архив."""
+    """Nightly consolidation: clusters of EPISODIC nodes → one CORE abstraction,
+    originals archived."""
     episodic = [n for n in g.nodes
                 if n["layer"] == "EPISODIC" and n["meta"].get("status") == "active" and n.get("emb")]
     clusters, used = [], set()
@@ -415,7 +435,8 @@ def sleep_cycle(g: Graph) -> dict:
     report = {"clusters": len(clusters), "archived": 0, "new_cores": []}
     for cl in clusters:
         texts = "\n".join(f"- {n['_text'][:150]}" for n in cl[:6])
-        abstraction = llm("Сожми эпизоды в одну общую абстракцию-урок. Одно предложение, по-русски.",
+        abstraction = llm("Compress these episodes into one general abstraction-lesson. "
+                          "One sentence, in the language of the episodes.",
                           texts, max_tokens=120)
         core = g.add_node(abstraction, layer="CORE", role="system",
                           meta={"kind": "abstraction", "from": [n["id"] for n in cl]})
@@ -431,14 +452,15 @@ def sleep_cycle(g: Graph) -> dict:
 
 
 def pulse(g: Graph) -> str:
-    """Автономный шаг: без стимула найти следующий шаг к целям. SILENCE = молчать."""
+    """Autonomous step: with no stimulus, find the next step toward active goals.
+    SILENCE = stay quiet (the default)."""
     goals = [n for n in g.nodes if n["layer"] == "GOAL" and n["meta"].get("status") == "active"]
     cores = sorted((n for n in g.nodes if n["layer"] == "CORE" and n["meta"].get("status") == "active"),
                    key=lambda n: -float(n["meta"].get("salience", 0.5)))[:5]
-    ctx = "ЦЕЛИ:\n" + "\n".join(f"- {n['_text'][:120]}" for n in goals[-5:]) if goals else ""
-    ctx += "\nЯДРО ПАМЯТИ:\n" + "\n".join(f"- {n['_text'][:120]}" for n in cores)
-    thought = llm("Ты в фоновом цикле. Найди ОДИН конкретный следующий шаг для целей. "
-                  "Если ничего конкретного — ответь ровно: SILENCE." + neuro_prompt_suffix(g.neuro), ctx)
+    ctx = "GOALS:\n" + "\n".join(f"- {n['_text'][:120]}" for n in goals[-5:]) if goals else ""
+    ctx += "\nMEMORY CORE:\n" + "\n".join(f"- {n['_text'][:120]}" for n in cores)
+    thought = llm("You are in a background cycle. Find ONE concrete next step toward the goals. "
+                  "If nothing concrete — reply exactly: SILENCE." + neuro_prompt_suffix(g.neuro), ctx)
     if "SILENCE" in thought.upper()[:40]:
         g.save()
         return ""
@@ -465,7 +487,7 @@ def export_ses(g: Graph, path: str) -> dict:
             "nodes": [{k: n[k] for k in ("id", "_text", "layer", "ts", "meta")} for n in g.nodes],
             "edges": g.edges, "affect": g.affect}
     h = hashlib.sha256(canonical_json(body).encode()).hexdigest()
-    doc = {"body": body, "provenance": {"hash": f"sha256:{h}", "engine": "qca_engine.py/hermes-port",
+    doc = {"body": body, "provenance": {"hash": f"sha256:{h}", "engine": "qca_engine.py",
                                         "emb_model": EMB_MODEL, "created": _now()}}
     json.dump(doc, open(path, "w"), ensure_ascii=False, indent=1)
     return doc["provenance"]
@@ -497,15 +519,15 @@ def main():
         g.save()
     elif cmd == "goal":
         n = g.add_node(" ".join(args), layer="GOAL", role="system")
-        g.save(); print(f"goal {n['id']} создана")
+        g.save(); print(f"goal {n['id']} created")
     elif cmd == "sleep":
         print(json.dumps(sleep_cycle(g), ensure_ascii=False, indent=1))
     elif cmd == "pulse":
         out = pulse(g)
         print(out if out else "SILENCE")
     elif cmd == "soul":
-        # Идентичность из графа: CORE по salience + цели + нейросостояние.
-        # Каждая генерация подписана хэшем SES-снапшота (провенанс изменений).
+        # Identity from the graph: CORE by salience + goals + neuro state.
+        # Every generation is signed with the SES snapshot hash (change provenance).
         path = args[0] if args else os.path.join(os.path.dirname(g.path), "SOUL_OCEAN.md")
         snap = os.path.join(os.path.dirname(g.path), "snapshot.ses.json")
         prov = export_ses(g, snap)
@@ -514,14 +536,14 @@ def main():
         goals = [n for n in g.nodes if n["layer"] == "GOAL" and n["meta"].get("status") == "active"]
         nr = g.neuro
         with open(path, "w") as f:
-            f.write("# Ocean — когнитивный слой (автогенерация из SES-графа)\n\n"
-                    f"> Источник истины: {snap}\n> Провенанс: {prov['hash']} | {prov['created']}\n"
-                    "> Этот файл НЕ редактируется руками — он пересоздаётся командой `soul`.\n\n"
-                    "## Ядро знаний (CORE, по значимости)\n"
+            f.write("# Cognitive layer identity (auto-generated from the SES graph)\n\n"
+                    f"> Source of truth: {snap}\n> Provenance: {prov['hash']} | {prov['created']}\n"
+                    "> Do NOT edit by hand — this file is regenerated by the `soul` command.\n\n"
+                    "## Knowledge core (CORE, by salience)\n"
                     + "\n".join(f"- {n['_text'][:200]}" for n in cores[:15])
-                    + "\n\n## Активные цели\n"
-                    + ("\n".join(f"- {n['_text'][:150]}" for n in goals[-10:]) or "- нет")
-                    + "\n\n## Нейросостояние на момент снапшота\n"
+                    + "\n\n## Active goals\n"
+                    + ("\n".join(f"- {n['_text'][:150]}" for n in goals[-10:]) or "- none")
+                    + "\n\n## Neuro state at snapshot time\n"
                     + f"dopamine {nr['dopamine']:+.2f} | pain {nr['pain']:.2f} | "
                       f"adrenaline {nr['adrenaline']:.2f} | serotonin {nr['serotonin']:.2f}\n")
         print(f"SOUL → {path}\nprovenance: {prov['hash']}")
@@ -530,7 +552,7 @@ def main():
         prov = export_ses(g, path)
         print(f"SES → {path}\n{json.dumps(prov, ensure_ascii=False, indent=1)}")
     else:
-        print(f"неизвестная команда: {cmd}\n{__doc__}")
+        print(f"unknown command: {cmd}\n{__doc__}")
 
 
 if __name__ == "__main__":
