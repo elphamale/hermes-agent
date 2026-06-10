@@ -20,9 +20,20 @@ LEARNED_DIR = os.path.expanduser(os.getenv("QCA_LEARNED_DIR", "~/.hermes/skills/
 
 
 def verify(path: str) -> bool:
+    """Verify a snapshot. Supports canonical SES v5.1 (meta.hash over the whole
+    snapshot, SES_CANON_JSON_v1 sorting) and the legacy body/provenance wrapper."""
     doc = json.load(open(path))
-    claimed = doc.get("provenance", {}).get("hash", "")
-    actual = "sha256:" + hashlib.sha256(canonical_json(doc["body"]).encode()).hexdigest()
+    if "initiator" in doc:  # canonical v5.1
+        from qca_engine import _snapshot_hash
+        claimed = doc.get("meta", {}).get("hash", "")
+        actual = _snapshot_hash(doc)
+        # v5.1 canon lock (§12): a state must reference its kernel
+        if doc.get("snapshot_type") == "STATE_SNAPSHOT" and not (
+                doc["meta"].get("kernel_ref") or doc["meta"].get("kernel_hash")):
+            print("⚠ canon violation: STATE_SNAPSHOT without kernel_ref/kernel_hash")
+    else:  # legacy
+        claimed = doc.get("provenance", {}).get("hash", "")
+        actual = "sha256:" + hashlib.sha256(canonical_json(doc["body"]).encode()).hexdigest()
     ok = claimed == actual
     print(f"{'✅ integrity verified' if ok else '❌ TAMPERED: hash mismatch'}")
     print(f"  claimed: {claimed}\n  actual:  {actual}")

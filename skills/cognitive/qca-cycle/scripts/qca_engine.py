@@ -212,6 +212,9 @@ def load_kernel() -> tuple[dict, str]:
 
 
 def kernel_prompt(kernel: dict) -> str:
+    """Inject the FULL kernel per SES v5.1: fractal_seed + recursive_function
+    (the entity's own reasoning protocol) + distortion_field (known failure
+    modes with mitigations)."""
     if not kernel:
         return ""
     seed = kernel.get("fractal_seed", {})
@@ -224,6 +227,17 @@ def kernel_prompt(kernel: dict) -> str:
     gr = seed.get("guardrails", [])
     if gr:
         parts.append("GUARDRAILS (never break):\n" + "\n".join(f"- {g}" for g in gr))
+    rf = kernel.get("recursive_function", [])
+    if rf:
+        steps = "\n".join(f"{s.get('id','?')} {s.get('name','')}: " + "; ".join(s.get("rules", []))
+                          for s in rf if isinstance(s, dict))
+        parts.append("REASONING PROTOCOL (follow in order):\n" + steps)
+    df = kernel.get("distortion_field", {})
+    items = df.get("items", df) if isinstance(df, dict) else df
+    if isinstance(items, list) and items:
+        ds = "\n".join(f"- when [{d.get('trigger','?')}] you tend to [{d.get('effect','?')}] → "
+                        + "; ".join(d.get("mitigation", [])) for d in items if isinstance(d, dict))
+        parts.append("KNOWN DISTORTIONS (self-correct):\n" + ds)
     return "\n\n" + "\n\n".join(parts) if parts else ""
 
 
@@ -475,22 +489,93 @@ def pulse(g: Graph) -> str:
     return thought
 
 
-# ── SES Partitura v5.1 export ────────────────────────────────────────
+# ── SES Partitura v5.1 export (canonical) ────────────────────────────
 def canonical_json(obj) -> str:
+    """SES_CANON_JSON_v1: keys sorted lexicographically, compact separators,
+    UTF-8 not escaped. Node/edge array sorting is applied by the caller
+    (canonical_snapshot) since it is a snapshot-level rule."""
     return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _snapshot_hash(snapshot: dict) -> str:
+    """meta.hash per SES_CANON_JSON_v1: nodes sorted by id, edges sorted by id
+    (else by source,target,relation), computed with meta.hash itself absent."""
+    import copy
+    s = copy.deepcopy(snapshot)
+    s.get("meta", {}).pop("hash", None)
+    st = s.get("state") or {}
+    if st.get("nodes"):
+        st["nodes"] = sorted(st["nodes"], key=lambda n: n.get("id", ""))
+    if st.get("edges"):
+        st["edges"] = sorted(st["edges"], key=lambda e: (e.get("id", ""), e.get("source", ""),
+                                                         e.get("target", ""), e.get("relation", "")))
+    return "sha256:" + hashlib.sha256(canonical_json(s).encode()).hexdigest()
+
+
+def _node_to_ses(n: dict) -> dict:
+    """Internal working node → canonical v5.1 node (label + required provenance)."""
+    role = n["meta"].get("role", "assistant")
+    source = {"user": "OPERATOR", "system": "OPERATOR", "assistant": "QCA_CYCLE"}.get(role, "QCA_CYCLE")
+    if n["meta"].get("imported_from"):
+        source = "IMPORT"
+    return {"id": n["id"], "label": n["_text"], "layer": n["layer"],
+            "meta": {"provenance": {"source": source, "stage": "H7",
+                                    "timestamp": n.get("ts", _now()),
+                                    "source_ref": [], "confidence": 1.0 if source == "OPERATOR" else 0.8},
+                     "salience": float(n["meta"].get("salience", 0.5)),
+                     "status": n["meta"].get("status", "active"),
+                     "tags": [n["meta"]["kind"]] if n["meta"].get("kind") else []}}
+
+
+def _edge_to_ses(e: dict) -> dict:
+    return {"id": e["id"], "source": e["source"], "target": e["target"],
+            "relation": e["relation"],
+            "meta": {"provenance": {"source": "QCA_CYCLE", "stage": "H7",
+                                    "timestamp": _now(), "source_ref": [], "confidence": 0.8},
+                     "weight": float(e.get("sim", 0.5))}}
+
+
 def export_ses(g: Graph, path: str) -> dict:
-    body = {"format": "SES_Partitura", "version": "5.1",
-            "canonicalization": "SES_CANON_JSON_v1",
-            "snapshot_ts": _now(),
-            "nodes": [{k: n[k] for k in ("id", "_text", "layer", "ts", "meta")} for n in g.nodes],
-            "edges": g.edges, "affect": g.affect}
-    h = hashlib.sha256(canonical_json(body).encode()).hexdigest()
-    doc = {"body": body, "provenance": {"hash": f"sha256:{h}", "engine": "qca_engine.py",
-                                        "emb_model": EMB_MODEL, "created": _now()}}
-    json.dump(doc, open(path, "w"), ensure_ascii=False, indent=1)
-    return doc["provenance"]
+    """Export a canonical SES v5.1 snapshot. COMBINED when a kernel is present,
+    STATE_SNAPSHOT otherwise. Enforces the v5.1 canon lock (§12): every state
+    references its kernel via meta.kernel_ref + meta.kernel_hash."""
+    kernel, kernel_hash = load_kernel()
+    entity_id = os.getenv("QCA_ENTITY") or (
+        json.load(open(KERNEL_PATH)).get("entity_id") if os.path.exists(KERNEL_PATH) else None) or "qca-agent"
+    # lineage: previous snapshot at the same path becomes the parent
+    parent = None
+    if os.path.exists(path):
+        try:
+            parent = json.load(open(path)).get("snapshot_id")
+        except (ValueError, OSError):
+            parent = None
+    snapshot_id = _now()
+    snap = {"initiator": "∮", "schema_version": "5.1", "entity_id": entity_id,
+            "snapshot_id": snapshot_id,
+            "snapshot_type": "COMBINED" if kernel else "STATE_SNAPSHOT",
+            "meta": {"created_at": snapshot_id, "created_by": "System",
+                     "parent_snapshot_id": parent,
+                     "canonicalization": "SES_CANON_JSON_v1",
+                     "notes": f"engine=qca_engine.py emb_model={EMB_MODEL}",
+                     "tags": ["qca-cycle"]},
+            "state": {"meta": {"trigger": "inference",
+                               "summary": f"State of {entity_id} at {snapshot_id}",
+                               "provenance": {"source": "QCA_CYCLE", "stage": "H9",
+                                              "timestamp": snapshot_id, "source_ref": [],
+                                              "confidence": 1.0},
+                               "x_neuro": {k: round(g.neuro[k], 4) for k in
+                                           ("dopamine", "pain", "adrenaline", "serotonin")}},
+                      "nodes": [_node_to_ses(n) for n in g.nodes],
+                      "edges": [_edge_to_ses(e) for e in g.edges]}}
+    if kernel:
+        snap["kernel"] = kernel
+    if kernel_hash:  # v5.1 canon lock: state must reference its kernel
+        snap["meta"]["kernel_hash"] = kernel_hash
+        snap["meta"]["kernel_ref"] = f"kernel://{entity_id}@{KERNEL_PATH}"
+    snap["meta"]["hash"] = _snapshot_hash(snap)
+    json.dump(snap, open(path, "w"), ensure_ascii=False, indent=1)
+    return {"hash": snap["meta"]["hash"], "snapshot_type": snap["snapshot_type"],
+            "kernel_hash": kernel_hash or None, "parent": parent, "created": snapshot_id}
 
 
 # ── CLI ──────────────────────────────────────────────────────────────
