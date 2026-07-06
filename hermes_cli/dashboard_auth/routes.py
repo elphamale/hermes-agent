@@ -192,6 +192,24 @@ async def auth_login(request: Request, provider: str, next: str = ""):
             status_code=404,
             detail=f"Provider does not support interactive login: {provider!r}",
         )
+    if getattr(p, "supports_password", False):
+        # Password-only providers (e.g. BasicAuthProvider) have no
+        # redirect-initiation flow -- start_login() isn't implemented for
+        # them and raises NotImplementedError, not the ProviderError this
+        # route already handles below, so it previously escaped as a raw
+        # 500. This is a defense-in-depth check alongside the one in
+        # _auto_sso_response (middleware.py), which is the normal caller
+        # this route expects; a stale bookmark or hand-built URL naming
+        # this provider explicitly hits this branch instead. The actual
+        # login page (not this endpoint) renders the password form and
+        # POSTs to /auth/password-login.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Provider {provider!r} does not support the redirect login "
+                "flow; use /auth/password-login instead."
+            ),
+        )
 
     try:
         ls = p.start_login(redirect_uri=_redirect_uri(request))
