@@ -23,8 +23,8 @@ def _manual_paste_login(monkeypatch, tmp_path, paste_value):
     )
     exchanged: dict = {}
 
-    def fake_exchange(**kwargs):
-        exchanged.update(kwargs)
+    def fake_token_post(accounts_base_url, data, **kwargs):
+        exchanged.update(data)
         return {
             "access_token": "fresh-access",
             "refresh_token": "fresh-refresh",
@@ -33,7 +33,7 @@ def _manual_paste_login(monkeypatch, tmp_path, paste_value):
             "scope": auth_mod.DEFAULT_SPOTIFY_SCOPE,
         }
 
-    monkeypatch.setattr(auth_mod, "_spotify_exchange_code_for_tokens", fake_exchange)
+    monkeypatch.setattr(auth_spotify, "_spotify_token_post", fake_token_post)
     monkeypatch.setattr("builtins.input", lambda prompt="": paste_value)
     args = SimpleNamespace(
         client_id="test-client", redirect_uri=None, scope=None,
